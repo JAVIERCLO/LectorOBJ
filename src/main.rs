@@ -1,33 +1,189 @@
-use std::fs::File;
-use std::io::{BufRead, BufReader, Result};
+// main.rs
 
-fn read_obj_and_print(obj_path: &str) -> Result<()> {
-    
-    let obj_file = File::open(obj_path)?;
-    let reader = BufReader::new(obj_file);
+mod framebuffer;
+mod triangle;
+mod line;
+mod vertex;
+mod fragment;
+mod shaders;
+mod obj;
+mod matrix;
 
-    for line in reader.lines() {
-        let line = line?;
+use crate::matrix::new_matrix4;
+use framebuffer::Framebuffer;
+use vertex::Vertex;
+use triangle::triangle;
+use shaders::vertex_shader;
+use obj::Obj;
+use raylib::prelude::*;
+use std::thread;
+use std::time::Duration;
+use std::f32::consts::PI;
 
-        if line.starts_with("v ") { // Vértices
-            let vertex_data: Vec<&str> = line.split_whitespace().collect();
-            println!("Vértice: {}", vertex_data[1..].join(", "));
-        } else if line.starts_with("vn ") { // Normales
-            let normal_data: Vec<&str> = line.split_whitespace().collect();
-            println!("Normal: {}", normal_data[1..].join(", "));
-        } else if line.starts_with("usemtl ") { // Materiales
-            let material_data: Vec<&str> = line.split_whitespace().collect();
-            println!("Material: {}", material_data[1]);
+pub struct Uniforms {
+    pub model_matrix: Matrix,
+}
+
+fn create_model_matrix(translation: Vector3, scale: f32, rotation: Vector3) -> Matrix {
+    let (sin_x, cos_x) = rotation.x.sin_cos();
+    let (sin_y, cos_y) = rotation.y.sin_cos();
+    let (sin_z, cos_z) = rotation.z.sin_cos();
+
+    // Rotation around the X-axis
+    let rotation_matrix_x = new_matrix4(
+        1.0, 0.0,    0.0,    0.0,
+        0.0, cos_x,  -sin_x, 0.0,
+        0.0, sin_x,  cos_x,  0.0,
+        0.0, 0.0,    0.0,    1.0
+    );
+
+    // Rotation around the Y-axis
+    let rotation_matrix_y = new_matrix4(
+        cos_y,  0.0, sin_y, 0.0,
+        0.0,    1.0, 0.0,   0.0,
+        -sin_y, 0.0, cos_y, 0.0,
+        0.0,    0.0, 0.0,   1.0
+    );
+
+    // Rotation around the Z-axis
+    let rotation_matrix_z = new_matrix4(
+        cos_z, -sin_z, 0.0, 0.0,
+        sin_z, cos_z,  0.0, 0.0,
+        0.0,   0.0,    1.0, 0.0,
+        0.0,   0.0,    0.0, 1.0
+    );
+
+    let rotation_matrix = rotation_matrix_z * rotation_matrix_y * rotation_matrix_x;
+
+    // Scaling matrix
+    let scale_matrix = new_matrix4(
+        scale, 0.0,   0.0,   0.0,
+        0.0,   scale, 0.0,   0.0,
+        0.0,   0.0,   scale, 0.0,
+        0.0,   0.0,   0.0,   1.0
+    );
+
+    // Translation matrix
+    let translation_matrix = new_matrix4(
+        1.0, 0.0, 0.0, translation.x,
+        0.0, 1.0, 0.0, translation.y,
+        0.0, 0.0, 1.0, translation.z,
+        0.0, 0.0, 0.0, 1.0
+    );
+
+    scale_matrix * rotation_matrix * translation_matrix
+}
+
+fn render(framebuffer: &mut Framebuffer, uniforms: &Uniforms, vertex_array: &[Vertex]) {
+    // Vertex Shader Stage
+    let mut transformed_vertices = Vec::with_capacity(vertex_array.len());
+    for vertex in vertex_array {
+        let transformed = vertex_shader(vertex, uniforms);
+        transformed_vertices.push(transformed);
+    }
+
+    let mut triangles = Vec::new();
+    for i in (0..transformed_vertices.len()).step_by(3) {
+        if i + 2 < transformed_vertices.len() {
+            triangles.push([
+                transformed_vertices[i].clone(),
+                transformed_vertices[i + 1].clone(),
+                transformed_vertices[i + 2].clone(),
+            ]);
         }
     }
 
-    Ok(())
+    // Rasterization Stage
+    let mut fragments = Vec::new();
+    for tri in &triangles {
+        fragments.extend(triangle(&tri[0], &tri[1], &tri[2]));
+    }
+
+    // Fragment Processing Stage
+    for fragment in fragments {
+        framebuffer.point(
+            fragment.position.x as i32,
+            fragment.position.y as i32,
+            fragment.color
+        );
+    }
 }
 
-fn main() -> Result<()> {
-    let obj_path = "src/modelosOBJ/humano.obj";
+fn main() {
+    let window_width = 800;
+    let window_height = 600;
 
-    read_obj_and_print(obj_path)?;
+    let (mut window, thread) = raylib::init()
+        .size(window_width, window_height)
+        .title("Rust Graphics - Renderer Example")
+        .log_level(TraceLogLevel::LOG_WARNING) // Suppress INFO messages
+        .build();
 
-    Ok(())
+    let mut framebuffer = Framebuffer::new(window_width as u32, window_height as u32);
+    framebuffer.set_background_color(Vector3::new(0.2, 0.2, 0.4)); // Dark blue-ish
+
+    // Initialize the texture inside the framebuffer
+    framebuffer.init_texture(&mut window, &thread);
+
+    let mut translation = Vector3::new(300.0, 300.0, 0.0);
+    let mut rotation = Vector3::new(0.0, 0.0, 0.0);
+    let mut scale = 50.0f32; // Set scale to 1.2
+
+    let obj = Obj::load("src/modelosOBJ/nave.obj").expect("Failed to load obj");
+    let vertex_array = obj.get_vertex_array();
+
+    while !window.window_should_close() {
+        handle_input(&mut window, &mut translation, &mut rotation, &mut scale);
+
+        framebuffer.clear();
+
+        let model_matrix = create_model_matrix(translation, scale, rotation);
+        let uniforms = Uniforms { model_matrix };
+
+        render(&mut framebuffer, &uniforms, &vertex_array);
+
+        // Call the encapsulated swap_buffers function
+        framebuffer.swap_buffers(&mut window, &thread);
+
+        thread::sleep(Duration::from_millis(16));
+    }
+}
+
+fn handle_input(window: &mut RaylibHandle, translation: &mut Vector3, rotation: &mut Vector3, scale: &mut f32) {
+    if window.is_key_down(KeyboardKey::KEY_RIGHT) {
+        translation.x += 10.0;
+    }
+    if window.is_key_down(KeyboardKey::KEY_LEFT) {
+        translation.x -= 10.0;
+    }
+    if window.is_key_down(KeyboardKey::KEY_UP) {
+        translation.y -= 10.0;
+    }
+    if window.is_key_down(KeyboardKey::KEY_DOWN) {
+        translation.y += 10.0;
+    }
+    if window.is_key_down(KeyboardKey::KEY_S) {
+        *scale += 0.1;
+    }
+    if window.is_key_down(KeyboardKey::KEY_A) {
+        *scale -= 0.1;
+    }
+    if window.is_key_down(KeyboardKey::KEY_Q) {
+        rotation.x -= PI / 10.0;
+    }
+    if window.is_key_down(KeyboardKey::KEY_W) {
+        rotation.x += PI / 10.0;
+    }
+    if window.is_key_down(KeyboardKey::KEY_E) {
+        rotation.y -= PI / 10.0;
+    }
+    if window.is_key_down(KeyboardKey::KEY_R) {
+        rotation.y += PI / 10.0;
+    }
+    if window.is_key_down(KeyboardKey::KEY_T) {
+        rotation.z -= PI / 10.0;
+    }
+    if window.is_key_down(KeyboardKey::KEY_Y) {
+        rotation.z += PI / 10.0;
+    }
 }
